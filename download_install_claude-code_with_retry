@@ -1,237 +1,394 @@
 #!/bin/bash
+# down_install_safe.sh - Descarga modelos Ollama en carpeta relativa y copia segura a Ollama
+# Versión modificada - Elimina run_model.sh y crea modelo directamente en Ollama
+# FIX: Usa el blob más grande (el modelo GGUF) en lugar del primer blob
+# FIX: Añade RENDERER y PARSER con el nombre del modelo que se está descargando
 
 set -e
 
-# Parse command line arguments
-TARGET="$1"  # Optional target parameter
+# Colores para output
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 
-# Validate target if provided
-if [[ -n "$TARGET" ]] && [[ ! "$TARGET" =~ ^(stable|latest|[0-9]+\.[0-9]+\.[0-9]+(-[^[:space:]]+)?)$ ]]; then
-    echo "Usage: $0 [stable|latest|VERSION]" >&2
-    exit 1
+# Funciones de logging
+print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[OK]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Uso
+show_usage() { echo "Uso: $0 <nombre-modelo> <tag>"; exit 1; }
+
+# Validar argumentos
+if [ $# -ne 2 ]; then
+    print_error "Se requieren 2 argumentos"
+    show_usage
 fi
 
-GCS_BUCKET="https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases"
-DOWNLOAD_DIR="$HOME/.claude/downloads"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLAUDE_BIN_DIR="$SCRIPT_DIR/claude_bin"
+MODEL_NAME="$1"
+MODEL_TAG="$2"
+REGISTRY="https://registry.ollama.ai"
 
-# Check for required dependencies
-DOWNLOADER=""
-if command -v wget >/dev/null 2>&1; then
-    DOWNLOADER="wget"
-elif command -v curl >/dev/null 2>&1; then
-    DOWNLOADER="curl"
+# Rutas absolutas basadas en el directorio actual
+BASE_DIR="$(pwd)/downloads"
+MODEL_DIR="${BASE_DIR}/${MODEL_NAME}"
+TAG_DIR="${MODEL_DIR}/${MODEL_TAG}"
+BLOBS_DIR="${TAG_DIR}/blobs"
+WORK_DIR="${TAG_DIR}"
+
+# Nombre local sanitizado para Ollama
+SANITIZED_NAME=$(echo "${MODEL_NAME}_${MODEL_TAG}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '_')
+LOCAL_MODEL_NAME="${SANITIZED_NAME}"
+
+print_info "Descargando ${MODEL_NAME}:${MODEL_TAG} en $WORK_DIR"
+
+# Crear directorios
+mkdir -p "$WORK_DIR" "$BLOBS_DIR"
+cd "$WORK_DIR"
+print_success "Estructura de directorios creada: $WORK_DIR"
+
+# -------------------------------
+# 1. Descargar manifiesto
+# -------------------------------
+MANIFEST_FILE="manifest.json"
+MANIFEST_URL="${REGISTRY}/v2/library/${MODEL_NAME}/manifests/${MODEL_TAG}"
+
+if [ ! -f "$MANIFEST_FILE" ]; then
+    print_info "Descargando manifiesto desde: $MANIFEST_URL"
+    wget -c --progress=bar:force --user-agent="Mozilla/5.0" --max-redirect=10 "$MANIFEST_URL" -O "$MANIFEST_FILE"
+    print_success "Manifiesto descargado"
 else
-    echo "Either wget or curl is required but neither is installed" >&2
+    print_success "Manifiesto ya existe"
+fi
+
+if [ ! -s "$MANIFEST_FILE" ]; then
+    print_error "Manifiesto vacío o inválido"
     exit 1
 fi
 
-# Check if jq is available (optional)
-HAS_JQ=false
-if command -v jq >/dev/null 2>&1; then
-    HAS_JQ=true
+# -------------------------------
+# 2. Extraer blobs
+# -------------------------------
+print_info "Extrayendo blobs..."
+BLOBS_LIST="blobs_hashes.txt"
+
+if command -v jq &> /dev/null; then
+    jq -r '.config.digest, .layers[].digest' "$MANIFEST_FILE" 2>/dev/null | grep -v null | sed 's/^sha256://' > "$BLOBS_LIST"
+else
+    grep -o '"digest":"sha256:[^"]*"' "$MANIFEST_FILE" | sed 's/"digest":"sha256://' | tr -d '"' > "$BLOBS_LIST"
 fi
 
-# Download function that works with both curl and wget (prefers wget with -c for resume)
-download_file() {
-    local url="$1"
-    local output="$2"
+TOTAL_BLOBS=$(wc -l < "$BLOBS_LIST")
+print_success "Se encontraron $TOTAL_BLOBS blobs"
+print_info "Blobs a descargar:"
+cat "$BLOBS_LIST" | while read hash; do echo "  - sha256:$hash"; done
+
+# -------------------------------
+# 3. Descargar blobs robustamente
+# -------------------------------
+print_info "Descargando blobs..."
+CURRENT=0
+FAILED=0
+LOG_FILE="download.log"
+
+# Guardar el directorio actual para referencias posteriores
+CURRENT_DIR="$(pwd)"
+
+while read BLOB_HASH; do
+    CURRENT=$((CURRENT+1))
+    # Usar ruta absoluta para el blob
+    BLOB_FILE="${BLOBS_DIR}/sha256-${BLOB_HASH}"
+    BLOB_URL="${REGISTRY}/v2/library/${MODEL_NAME}/blobs/sha256:${BLOB_HASH}"
     
-    if [ "$DOWNLOADER" = "wget" ]; then
-        if [ -n "$output" ]; then
-            wget -c -q --show-progress -O "$output" "$url"
-        else
-            wget -q -O - "$url"
+    print_info "[$CURRENT/$TOTAL_BLOBS] Descargando/Reanudando: sha256:${BLOB_HASH:0:16}..."
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Blob $CURRENT/$TOTAL_BLOBS: $BLOB_HASH" >> "$LOG_FILE"
+    
+    # Verificar si el archivo ya existe y parece completo
+    if [ -f "$BLOB_FILE" ]; then
+        if command -v jq &> /dev/null; then
+            EXPECTED_SIZE=$(jq -r ".layers[] | select(.digest == \"sha256:${BLOB_HASH}\") | .size // empty" "$MANIFEST_FILE" 2>/dev/null)
+            ACTUAL_SIZE=$(stat -c%s "$BLOB_FILE" 2>/dev/null || stat -f%z "$BLOB_FILE" 2>/dev/null)
+            if [ -n "$EXPECTED_SIZE" ] && [ "$ACTUAL_SIZE" -eq "$EXPECTED_SIZE" ]; then
+                print_success "Blob $CURRENT/$TOTAL_BLOBS ya existe y está completo (${ACTUAL_SIZE} bytes)"
+                continue
+            elif [ -n "$EXPECTED_SIZE" ]; then
+                print_warning "Blob incompleto: ${ACTUAL_SIZE}/${EXPECTED_SIZE} bytes, reanudando..."
+            fi
         fi
-    elif [ "$DOWNLOADER" = "curl" ]; then
-        if [ -n "$output" ]; then
-            curl -C - -fsSL -o "$output" "$url"
+    fi
+    
+    # Asegurar que el directorio existe
+    mkdir -p "$(dirname "$BLOB_FILE")"
+    
+    # Descargar con wget -c
+    if wget -c --progress=bar:force --timeout=30 --tries=5 --retry-connrefused \
+        "$BLOB_URL" -O "$BLOB_FILE" 2>&1; then
+        
+        # Verificar tamaño después
+        if command -v jq &> /dev/null; then
+            EXPECTED_SIZE=$(jq -r ".layers[] | select(.digest == \"sha256:${BLOB_HASH}\") | .size // empty" "$MANIFEST_FILE" 2>/dev/null)
+            ACTUAL_SIZE=$(stat -c%s "$BLOB_FILE" 2>/dev/null || stat -f%z "$BLOB_FILE" 2>/dev/null)
+            if [ -n "$EXPECTED_SIZE" ] && [ "$ACTUAL_SIZE" -eq "$EXPECTED_SIZE" ]; then
+                print_success "Blob $CURRENT/$TOTAL_BLOBS completado y verificado (${ACTUAL_SIZE} bytes)"
+            else
+                print_warning "Blob $CURRENT/$TOTAL_BLOBS descargado pero tamaño no verificado"
+            fi
         else
-            curl -fsSL "$url"
+            print_success "Blob $CURRENT/$TOTAL_BLOBS descargado/reanudado"
         fi
     else
-        return 1
-    fi
-}
-
-# Simple JSON parser for extracting checksum when jq is not available
-get_checksum_from_manifest() {
-    local json="$1"
-    local platform="$2"
-    
-    # Normalize JSON to single line and extract checksum
-    json=$(echo "$json" | tr -d '\n\r\t' | sed 's/ \+/ /g')
-    
-    # Extract checksum for platform using bash regex
-    if [[ $json =~ \"$platform\"[^}]*\"checksum\"[[:space:]]*:[[:space:]]*\"([a-f0-9]{64})\" ]]; then
-        echo "${BASH_REMATCH[1]}"
-        return 0
+        print_error "Error descargando blob $BLOB_HASH"
+        FAILED=$((FAILED+1))
+        echo "[ERROR] Falló descarga de $BLOB_HASH" >> "$LOG_FILE"
     fi
     
-    return 1
-}
+    sleep 1
+done < "$BLOBS_LIST"
 
-# Detect platform
-case "$(uname -s)" in
-    Darwin) os="darwin" ;;
-    Linux) os="linux" ;;
-    MINGW*|MSYS*|CYGWIN*) echo "Windows is not supported by this script. See https://code.claude.com/docs for installation options." >&2; exit 1 ;;
-    *) echo "Unsupported operating system: $(uname -s). See https://code.claude.com/docs for supported platforms." >&2; exit 1 ;;
-esac
+if [ $FAILED -gt 0 ]; then
+    print_error "$FAILED blobs fallaron. Reintenta el script"
+    exit 1
+fi
+print_success "Todos los blobs descargados correctamente"
 
-case "$(uname -m)" in
-    x86_64|amd64) arch="x64" ;;
-    arm64|aarch64) arch="arm64" ;;
-    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-esac
+# -------------------------------
+# 4. Generar Modelfile (con el blob correcto)
+# -------------------------------
+# FIX: Encontrar el blob más grande (el modelo GGUF) en lugar del primer blob
+# Esto es crucial porque el primer blob suele ser el archivo de configuración (pequeño)
+# y el blob grande es el modelo real que Ollama necesita
 
-# Detect Rosetta 2 on macOS: if the shell is running as x64 under Rosetta on an ARM Mac,
-# download the native arm64 binary instead of the x64 one
-if [ "$os" = "darwin" ] && [ "$arch" = "x64" ]; then
-    if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then
-        arch="arm64"
-    fi
+print_info "Identificando el blob del modelo (el más grande)..."
+
+# Buscar el archivo más grande en el directorio blobs/
+LARGEST_BLOB_FILE=$(ls -S "${BLOBS_DIR}/sha256-"* 2>/dev/null | head -1)
+
+if [ -z "$LARGEST_BLOB_FILE" ]; then
+    print_error "No se encontraron blobs en ${BLOBS_DIR}"
+    exit 1
 fi
 
-# Check for musl on Linux and adjust platform accordingly
-if [ "$os" = "linux" ]; then
-    if [ -f /lib/libc.musl-x86_64.so.1 ] || [ -f /lib/libc.musl-aarch64.so.1 ] || ldd /bin/ls 2>&1 | grep -q musl; then
-        platform="linux-${arch}-musl"
-    else
-        platform="linux-${arch}"
-    fi
+# Extraer el hash del blob más grande
+LARGEST_BLOB_HASH=$(basename "$LARGEST_BLOB_FILE" | sed 's/^sha256-//')
+LARGEST_BLOB_SIZE=$(stat -c%s "$LARGEST_BLOB_FILE" 2>/dev/null || stat -f%z "$LARGEST_BLOB_FILE" 2>/dev/null)
+LARGEST_BLOB_SIZE_HUMAN=$(numfmt --to=iec --suffix=B "$LARGEST_BLOB_SIZE" 2>/dev/null || echo "${LARGEST_BLOB_SIZE} bytes")
+
+print_success "Blob del modelo identificado: sha256-${LARGEST_BLOB_HASH:0:16}... (tamaño: ${LARGEST_BLOB_SIZE_HUMAN})"
+
+# Crear un enlace simbólico directo al blob del modelo en la raíz para fácil acceso
+ln -sf "blobs/sha256-${LARGEST_BLOB_HASH}" "model.gguf" 2>/dev/null || true
+
+MODELFILE="Modelfile"
+
+if command -v jq &> /dev/null; then
+    TEMPLATE=$(jq -r '.config.template // empty' "$MANIFEST_FILE" 2>/dev/null)
+    PARAMETERS=$(jq -r '.config.parameters // empty' "$MANIFEST_FILE" 2>/dev/null)
+    SYSTEM=$(jq -r '.config.system // empty' "$MANIFEST_FILE" 2>/dev/null)
 else
-    platform="${os}-${arch}"
+    TEMPLATE=""; PARAMETERS=""; SYSTEM=""
 fi
 
-# Create necessary directories
-mkdir -p "$DOWNLOAD_DIR"
-mkdir -p "$CLAUDE_BIN_DIR"
-
-# Always download latest version (which has the most up-to-date installer)
-echo "Fetching latest version information..."
-version=$(download_file "$GCS_BUCKET/latest")
-
-# Download manifest and extract checksum
-echo "Downloading manifest for version $version..."
-manifest_json=$(download_file "$GCS_BUCKET/$version/manifest.json")
-
-# Use jq if available, otherwise fall back to pure bash parsing
-if [ "$HAS_JQ" = true ]; then
-    checksum=$(echo "$manifest_json" | jq -r ".platforms[\"$platform\"].checksum // empty")
-else
-    checksum=$(get_checksum_from_manifest "$manifest_json" "$platform")
-fi
-
-# Validate checksum format (SHA256 = 64 hex characters)
-if [ -z "$checksum" ] || [[ ! "$checksum" =~ ^[a-f0-9]{64}$ ]]; then
-    echo "Platform $platform not found in manifest" >&2
-    exit 1
-fi
-
-# Download and verify to claude_bin directory
-binary_name="claude-$version-$platform"
-binary_path="$CLAUDE_BIN_DIR/$binary_name"
-echo "Downloading Claude Code binary to $binary_path..."
-if ! download_file "$GCS_BUCKET/$version/$platform/claude" "$binary_path"; then
-    echo "Download failed" >&2
-    rm -f "$binary_path"
-    exit 1
-fi
-
-# Pick the right checksum tool
-if [ "$os" = "darwin" ]; then
-    actual=$(shasum -a 256 "$binary_path" | cut -d' ' -f1)
-else
-    actual=$(sha256sum "$binary_path" | cut -d' ' -f1)
-fi
-
-echo "Verifying checksum..."
-if [ "$actual" != "$checksum" ]; then
-    echo "Checksum verification failed" >&2
-    echo "Expected: $checksum" >&2
-    echo "Got: $actual" >&2
-    rm -f "$binary_path"
-    exit 1
-fi
-
-chmod +x "$binary_path"
-echo "✅ Binary downloaded and verified successfully!"
-
-# Copy to downloads directory
-echo "Copying binary to $DOWNLOAD_DIR..."
-cp "$binary_path" "$DOWNLOAD_DIR/"
-
-# Create installation script
-INSTALL_SCRIPT="$SCRIPT_DIR/install_claude.sh"
-echo "Creating installation script at $INSTALL_SCRIPT..."
-
-cat > "$INSTALL_SCRIPT" << 'EOF'
-#!/bin/bash
-
-set -e
-
-# Get the directory where this script is located
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLAUDE_BIN_DIR="$SCRIPT_DIR/claude_bin"
-DOWNLOAD_DIR="$HOME/.claude/downloads"
-
-# Find the latest binary in claude_bin directory
-echo "Looking for Claude Code binary..."
-binary_path=$(ls -t "$CLAUDE_BIN_DIR"/claude-* 2>/dev/null | head -n1)
-
-if [ -z "$binary_path" ]; then
-    echo "Error: No Claude Code binary found in $CLAUDE_BIN_DIR" >&2
-    echo "Please run the download script first." >&2
-    exit 1
-fi
-
-echo "Found binary: $binary_path"
-
-# Parse target if provided
-TARGET="$1"
-if [[ -n "$TARGET" ]] && [[ ! "$TARGET" =~ ^(stable|latest|[0-9]+\.[0-9]+\.[0-9]+(-[^[:space:]]+)?)$ ]]; then
-    echo "Usage: $0 [stable|latest|VERSION]" >&2
-    exit 1
-fi
-
-# Run claude install to set up launcher and shell integration
-echo "Setting up Claude Code..."
-"$binary_path" install ${TARGET:+"$TARGET"}
-
-# Also ensure the binary is available in downloads directory
-echo "Ensuring binary is available in downloads directory..."
-if [ -f "$DOWNLOAD_DIR/$(basename "$binary_path")" ]; then
-    echo "Binary already present in $DOWNLOAD_DIR"
-else
-    echo "Copying binary to $DOWNLOAD_DIR..."
-    cp "$binary_path" "$DOWNLOAD_DIR/"
-fi
-
-echo ""
-echo "✅ Installation complete!"
-echo ""
-echo "Claude Code has been installed and configured."
-echo "You can now run 'claude' from your terminal."
+# Usar el blob más grande en lugar del primer blob
+cat > "$MODELFILE" << EOF
+# Modelfile para ${MODEL_NAME}:${MODEL_TAG}
+FROM ./blobs/sha256-${LARGEST_BLOB_HASH}
 EOF
 
-chmod +x "$INSTALL_SCRIPT"
+[ -n "$TEMPLATE" ] && [ "$TEMPLATE" != "null" ] && cat >> "$MODELFILE" << EOF
+TEMPLATE """${TEMPLATE}"""
+EOF
 
-echo ""
-echo "========================================="
-echo "✅ Download completed successfully!"
-echo "========================================="
-echo ""
-echo "Binary location: $binary_path"
-echo "Backup location: $DOWNLOAD_DIR/$binary_name"
-echo "Installation script: $INSTALL_SCRIPT"
-echo ""
-echo "To complete the installation, run:"
-echo "  $INSTALL_SCRIPT ${TARGET:+"$TARGET"}"
-echo ""
-echo "Or if you want to run the installation with a specific target:"
-echo "  $INSTALL_SCRIPT stable"
-echo "  $INSTALL_SCRIPT latest"
-echo "  $INSTALL_SCRIPT 1.0.0"
-echo ""
+[ -n "$SYSTEM" ] && [ "$SYSTEM" != "null" ] && cat >> "$MODELFILE" << EOF
+SYSTEM """${SYSTEM}"""
+EOF
+
+[ -n "$PARAMETERS" ] && [ "$PARAMETERS" != "null" ] && cat >> "$MODELFILE" << EOF
+${PARAMETERS}
+EOF
+
+print_success "Modelfile generado: $MODELFILE (usando blob del modelo: ${LARGEST_BLOB_HASH:0:16}...)"
+
+# Crear enlace simbólico a blobs
+BLOBS_LINK="blobs"
+[ ! -L "$BLOBS_LINK" ] && ln -s "blobs" "$BLOBS_LINK" && print_info "Enlace simbólico creado: $BLOBS_LINK -> blobs"
+
+# -------------------------------
+# 5. Copiar todo a Ollama
+# -------------------------------
+OLLAMA_DIR="$HOME/.ollama/models/${LOCAL_MODEL_NAME}"
+mkdir -p "$OLLAMA_DIR"
+cp -r "$WORK_DIR"/* "$OLLAMA_DIR/"
+print_success "Modelo copiado a Ollama: $OLLAMA_DIR"
+
+# -------------------------------
+# 6. Crear el modelo en Ollama (similar a crear_modelo.sh)
+# -------------------------------
+print_info "Creando modelo en Ollama..."
+
+# FIX: Usar el blob más grande (el modelo real) en lugar del primer blob
+MODEL_BLOB="${OLLAMA_DIR}/blobs/sha256-${LARGEST_BLOB_HASH}"
+
+# Verificar que existe el modelo
+if [ ! -f "$MODEL_BLOB" ]; then
+    print_error "No se encuentra el modelo en $MODEL_BLOB"
+    exit 1
+fi
+
+MODEL_SIZE=$(du -h "$MODEL_BLOB" | cut -f1)
+print_success "Modelo encontrado (tamaño: $MODEL_SIZE)"
+
+# Crear Modelfile temporal con configuración optimizada
+TEMP_MODELFILE="/tmp/Modelfile-${SANITIZED_NAME}"
+
+print_info "Creando Modelfile optimizado..."
+
+# Intentar extraer información del manifiesto original
+if command -v jq &> /dev/null; then
+    ORIGINAL_TEMPLATE=$(jq -r '.config.template // empty' "$MANIFEST_FILE" 2>/dev/null)
+    ORIGINAL_SYSTEM=$(jq -r '.config.system // empty' "$MANIFEST_FILE" 2>/dev/null)
+    ORIGINAL_PARAMETERS=$(jq -r '.config.parameters // empty' "$MANIFEST_FILE" 2>/dev/null)
+else
+    ORIGINAL_TEMPLATE=""; ORIGINAL_SYSTEM=""; ORIGINAL_PARAMETERS=""
+fi
+
+# ============================================================
+# USAR EL NOMBRE DEL MODELO PARA RENDERER Y PARSER
+# ============================================================
+# Extraer el nombre base del modelo (sin tag)
+# Ejemplo: "qwen3.5:9b" -> "qwen3.5"
+BASE_MODEL_NAME=$(echo "${MODEL_NAME}" | tr '[:upper:]' '[:lower:]')
+print_info "Usando nombre de modelo '${BASE_MODEL_NAME}' para RENDERER y PARSER"
+
+# Crear Modelfile con configuración mejorada
+cat > "$TEMP_MODELFILE" << EOF
+# Modelo ${MODEL_NAME}:${MODEL_TAG}
+FROM ${MODEL_BLOB}
+
+# Parámetros optimizados
+PARAMETER temperature 0.7
+PARAMETER top_p 0.9
+PARAMETER top_k 40
+PARAMETER num_ctx 8192
+PARAMETER num_predict 2048
+PARAMETER repeat_penalty 1.1
+EOF
+
+# ============================================================
+# AÑADIR RENDERER Y PARSER CON EL NOMBRE DEL MODELO
+# ============================================================
+cat >> "$TEMP_MODELFILE" << EOF
+
+# RENDERER y PARSER para ${BASE_MODEL_NAME} - HABILITAN TOOL CALLING
+RENDERER ${BASE_MODEL_NAME}
+PARSER ${BASE_MODEL_NAME}
+EOF
+print_info "Añadidas líneas RENDERER ${BASE_MODEL_NAME} y PARSER ${BASE_MODEL_NAME} al Modelfile"
+
+# Añadir template si existe en el manifiesto original
+if [ -n "$ORIGINAL_TEMPLATE" ] && [ "$ORIGINAL_TEMPLATE" != "null" ]; then
+    cat >> "$TEMP_MODELFILE" << EOF
+
+# Template extraído del manifiesto
+TEMPLATE """${ORIGINAL_TEMPLATE}"""
+EOF
+else
+    # Template específico para Qwen (formato chatml) - se mantiene igual para todos
+    cat >> "$TEMP_MODELFILE" << EOF
+
+# Template genérico (formato ChatML)
+TEMPLATE """{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{- end }}{{- if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{- end }}<|im_start|>assistant
+"""
+EOF
+fi
+
+# Añadir sistema si existe en el manifiesto
+if [ -n "$ORIGINAL_SYSTEM" ] && [ "$ORIGINAL_SYSTEM" != "null" ]; then
+    cat >> "$TEMP_MODELFILE" << EOF
+
+# Sistema extraído del manifiesto
+SYSTEM """${ORIGINAL_SYSTEM}"""
+EOF
+else
+    cat >> "$TEMP_MODELFILE" << EOF
+
+# Mensaje del sistema por defecto
+SYSTEM """Eres un asistente útil, respetuoso y honesto."""
+EOF
+fi
+
+# Añadir parámetros extra si existen
+if [ -n "$ORIGINAL_PARAMETERS" ] && [ "$ORIGINAL_PARAMETERS" != "null" ]; then
+    cat >> "$TEMP_MODELFILE" << EOF
+
+# Parámetros adicionales del manifiesto
+${ORIGINAL_PARAMETERS}
+EOF
+fi
+
+print_success "Modelfile creado en $TEMP_MODELFILE"
+
+# Mostrar el contenido del Modelfile para depuración
+print_info "Contenido del Modelfile generado:"
+echo "----------------------------------------"
+cat "$TEMP_MODELFILE"
+echo "----------------------------------------"
+
+# Crear el modelo en Ollama
+print_info "Ejecutando 'ollama create'..."
+
+# ELIMINAR EL MODELO EXISTENTE SI EXISTE PARA SOBRESCRIBIRLO
+FINAL_MODEL_NAME="${MODEL_NAME}:${MODEL_TAG}"
+
+if ollama list | grep -q "^${FINAL_MODEL_NAME}[[:space:]]"; then
+    print_warning "El modelo ${FINAL_MODEL_NAME} ya existe. Eliminándolo para sobrescribir..."
+    ollama rm "$FINAL_MODEL_NAME" || true
+    print_success "Modelo anterior eliminado"
+fi
+
+ollama create "$FINAL_MODEL_NAME" -f "$TEMP_MODELFILE"
+
+if [ $? -eq 0 ]; then
+    echo -e "\n${GREEN}========================================${NC}"
+    echo -e "${GREEN}   ¡Modelo creado exitosamente!${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${BLUE}Nombre del modelo:${NC} $FINAL_MODEL_NAME"
+    echo -e "${BLUE}Archivos almacenados en:${NC} $OLLAMA_DIR"
+    echo -e "${BLUE}Blob del modelo utilizado:${NC} sha256-${LARGEST_BLOB_HASH:0:16}... (${MODEL_SIZE})"
+    echo -e "${BLUE}RENDERER/PARSER configurado como:${NC} ${BASE_MODEL_NAME}"
+    
+    echo -e "\n${YELLOW}⚠️  IMPORTANTE:${NC}"
+    echo -e "${YELLOW}Este modelo tiene RENDERER y PARSER configurados como '${BASE_MODEL_NAME}', lo que habilita TOOL CALLING${NC}"
+    echo -e "${YELLOW}Para verificar que tools están habilitadas, ejecuta:${NC}"
+    echo -e "  ollama show $FINAL_MODEL_NAME | grep -A5 Capabilities"
+    
+    echo -e "\n${YELLOW}Para ejecutar el modelo:${NC}"
+    echo -e "  ollama run $FINAL_MODEL_NAME"
+    echo -e "\n${YELLOW}Para probar con un prompt:${NC}"
+    echo -e "  ollama run $FINAL_MODEL_NAME '¿Cuál es la capital de Francia?'"
+    echo -e "\n${YELLOW}Para listar todos tus modelos:${NC}"
+    echo -e "  ollama list"
+else
+    print_error "No se pudo crear el modelo"
+    exit 1
+fi
+
+# -------------------------------
+# 7. Crear README
+# -------------------------------
+README_FILE="README.md"
+cat > "$README_FILE" << EOF
+# Modelo: ${MODEL_NAME}:${MODEL_TAG}
+- Nombre del modelo en Ollama: ${FINAL_MODEL_NAME}
+- Blobs: ${TOTAL_BLOBS}
+- Blob del modelo: sha256-${LARGEST_BLOB_HASH} (${MODEL_SIZE})
+- Carpeta de archivos: ${OLLAMA_DIR}
+- RENDERER/PARSER: ${BASE_MODEL_NAME}
+- Ejecutar: ollama run ${FINAL_MODEL_NAME}
+EOF
+
+print_success "README creado: $README_FILE"
+
+print_success "¡Descarga completa y modelo listo en Ollama!"
